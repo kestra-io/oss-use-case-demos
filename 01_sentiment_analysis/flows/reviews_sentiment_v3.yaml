@@ -1,0 +1,106 @@
+id: reviews_sentiment
+namespace: demo.use_cases
+
+inputs:
+  - id: record
+    type: JSON
+    defaults: |
+      {"review_id":"REV-001","customer_id":"CUST-1042","customer_tier":"Standard","product_id":"PROD-NOVA-BT500","review_text":"I've been a casual audio enthusiast for years and have tried dozens of headphones in the mid-range bracket, but the NovaSound BT500 has genuinely surprised me. The moment I slipped them on I noticed how light they feel despite the solid build quality — the ear cups are generously padded and don't cause fatigue even after three or four hours of continuous use. Pairing was effortless; my phone found the headphones instantly and reconnected automatically every time afterward without a single dropout. Sound quality is where these really shine. The bass is punchy without being overblown, mids are clear enough for podcasts and audiobooks, and the highs have a brightness that doesn't tip into harshness. Battery life has been exceptional — I'm getting close to 28 hours per charge, which means I rarely need to think about plugging them in. The active noise cancellation isn't class-leading, but it handles open-plan office noise and commute rumble very comfortably. My only minor gripe is that the companion app feels a bit dated and the EQ options are limited. That said, for the price, the NovaSound BT500 punches well above its weight. I'd recommend these without hesitation to anyone looking for reliable everyday headphones.","timestamp":"2026-04-03T08:14:22Z"}
+
+tasks:
+  - id: log
+    type: io.kestra.plugin.core.log.Log
+    message: "{{ inputs.record.review_text }}"
+  - id: sentiment_analysis
+    type: io.kestra.plugin.ai.completion.JSONStructuredExtraction
+    provider:
+      type: io.kestra.plugin.ai.provider.OpenAI
+      apiKey: "{{ secret('OPENAI_API_KEY') }}"
+      modelName: "gpt-4o-mini"
+    schemaName: llmOutputSchema
+    jsonFields:
+      - sentiment
+      - confidence
+      - key_topics
+    prompt: |
+      Analyse the following customer review and extract:
+      
+      - sentiment: a JSON string mapping to exactly one of Positive, Neutral, Negative }}
+      - confidence: a JSON number between 0.0 and 1.0 representing your certainty about the sentiment as a numeric value.
+      - key_topics: a JSON string array of up to 5 key topics mentioned in the review
+
+      Example for a valid JSON result object:
+
+      {
+        "sentiment": "Positive",
+        "confidence": 0.95,
+        "key_topics": [
+          "headphones",
+          "sound quality",
+          "battery life",
+          "active noise cancellation",
+          "comfort"
+        ]
+      }
+
+      Review to analyze: {{ inputs.record.review_text }}
+
+  - id: ingest_to_vector_db
+    type: io.kestra.plugin.ai.rag.IngestDocument
+    provider:
+      type: io.kestra.plugin.ai.provider.OpenAI
+      apiKey: "{{ secret('OPENAI_API_KEY') }}"
+      modelName: text-embedding-3-small
+    embeddings:
+      type: io.kestra.plugin.ai.embeddings.MongoDBAtlas
+      host: mongodb
+      scheme: mongodb
+      username: root
+      password: "{{ secret('MONGODB_PASSWORD') }}"
+      database: reviews_db
+      collectionName: customer_reviews
+      indexName: vector_index
+      options:
+        authSource: admin
+      metadataFieldNames:
+        - review_id
+        - customer_id
+        - customer_tier
+        - product_id
+        - timestamp
+        - sentiment
+        - confidence
+        - key_topics
+    fromDocuments:
+      - content: "{{ inputs.record.review_text }}"
+        metadata:
+          review_id: "{{ inputs.record.review_id }}"
+          customer_id: "{{ inputs.record.customer_id }}"
+          customer_tier: "{{ inputs.record.customer_tier }}"
+          product_id: "{{ inputs.record.product_id }}"
+          timestamp: "{{ inputs.record.timestamp }}"
+          sentiment: "{{ json(outputs.sentiment_analysis.extractedJson).sentiment }}"
+          confidence: "{{ json(outputs.sentiment_analysis.extractedJson).confidence }}"
+          key_topics: "{{ json(outputs.sentiment_analysis.extractedJson).key_topics }}"
+
+  - id: conditional_slack_alert
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    runIf: "{{ json(outputs.sentiment_analysis.extractedJson).sentiment == 'Negative' and inputs.record.customer_tier == 'Premium' }}"
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    payload: |
+        {
+          "blocks": [
+            {
+              "type": "header",
+              "text": { "type": "plain_text", "text": ":rotating_light: Negative Review — Premium Customer" }
+            },
+            {
+              "type": "section",
+              "fields": [
+                { "type": "mrkdwn", "text": "*Review ID:*\n{{ inputs.record.review_id }}" },
+                { "type": "mrkdwn", "text": "*Customer:*\n{{ inputs.record.customer_id }}" },
+                { "type": "mrkdwn", "text": "*Product:*\n{{ inputs.record.product_id }}" }
+              ]
+            }
+          ]
+        }

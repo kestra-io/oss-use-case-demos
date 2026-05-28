@@ -1,0 +1,149 @@
+volumes:
+  postgres-data-v1320:
+    driver: local
+  kestra-data-v1320:
+    driver: local
+
+services:
+  postgres:
+    image: postgres:18.3
+    container_name: postgres
+    volumes:
+      - postgres-data-v1320:/var/lib/postgresql
+    environment:
+      POSTGRES_DB: kestra
+      POSTGRES_USER: kestra
+      POSTGRES_PASSWORD: k3str4
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -d $${POSTGRES_DB} -U $${POSTGRES_USER}"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+
+  kestra:
+    image: kestra/kestra:v1.3.20
+    container_name: kestra
+    pull_policy: if_not_present
+    # Kestra, by default, has a termination grace period of 5m. We need to wait a little more to be sure no active tasks are running.
+    stop_grace_period: 6m
+    # Note that this setup with a root user is intended for development purpose.
+    # Our base image runs without root, but the Docker Compose implementation needs root to access the Docker socket
+    user: "root"
+    command: server standalone
+    volumes:
+      - kestra-data-v1320:/app/storage
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /tmp/kestra-wd:/tmp/kestra-wd
+    environment:
+      SECRET_MONGODB_PASSWORD: "c2VjcmV0"
+      ############################################################################
+      # TODO: add the respective secrets needed for this use case
+      # 1) uncomment the line below and add your Base64 encoded OpenAI API Key
+      #SECRET_OPENAI_API_KEY: "<ADD_YOUR_BASE64_ENCODED_OPENAI_API_KEY_HERE>"
+      # 2) uncomment the line below and add your Base64 encoded Slack Webhook URL
+      #SECRET_SLACK_WEBHOOK_URL: "<ADD_YOUR_BASE64_ENCODED_WEBHOOK_URL_HERE>"
+      ############################################################################
+      KESTRA_CONFIGURATION: |
+        datasources:
+          postgres:
+            url: jdbc:postgresql://postgres:5432/kestra
+            driverClassName: org.postgresql.Driver
+            username: kestra
+            password: k3str4
+        kestra:
+          server:
+            basic-auth:
+              username: admin@kestra.io
+              password: Admin1234!
+          repository:
+            type: postgres
+          storage:
+            type: local
+            local:
+              base-path: "/app/storage"
+          queue:
+            type: postgres
+          tasks:
+            tmp-dir:
+              path: /tmp/kestra-wd/tmp
+          url: http://localhost:8080/
+    ports:
+      - "8080:8080"
+      - "8081:8081"
+      - "5005:5005"
+    depends_on:
+      postgres:
+        condition: service_started
+
+  kafka:
+    hostname: kafka
+    container_name: kafka
+    image: quay.io/strimzi/kafka:0.51.0-kafka-4.2.0
+    command: [
+      "sh", "-c",
+      "./bin/kafka-storage.sh format --standalone -t $${KAFKA_CLUSTER_ID} -c ./config/server.properties && ./bin/kafka-server-start.sh ./config/server.properties --override inter.broker.listener.name=$${KAFKA_INTER_BROKER_LISTENER_NAME} --override listener.security.protocol.map=$${KAFKA_LISTENER_SECURITY_PROTOCOL_MAP} --override listeners=$${KAFKA_LISTENERS} --override controller.listener.names=$${KAFKA_CONTROLLER_LISTENER_NAMES} --override advertised.listeners=$${KAFKA_ADVERTISED_LISTENERS} --override num.partitions=$${KAFKA_NUM_PARTITIONS} --override group.min.session.timeout.ms=$${KAFKA_GROUP_MIN_SESSION_TIMEOUT_MS} --override message.max.bytes=16777216"
+    ]
+    ports:
+      - 9092:9092
+      - 29092:29092
+    volumes:
+      - ./stream_reviews.sh:/home/stream_reviews.sh
+      - ./data/reviews.jsonl:/home/reviews.jsonl
+    environment:
+      LOG_DIR: /tmp/logs
+      KAFKA_CLUSTER_ID: DIAO2SH9SdGuqBkcKYXtiw
+      KAFKA_ADVERTISED_LISTENERS: DOCKER_INSIDE://kafka:9092,DOCKER_OUTSIDE://localhost:29092
+      KAFKA_LISTENERS: DOCKER_INSIDE://kafka:9092,DOCKER_OUTSIDE://0.0.0.0:29092,CONTROLLER://:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: DOCKER_INSIDE:PLAINTEXT,DOCKER_OUTSIDE:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: DOCKER_INSIDE
+      KAFKA_GROUP_MIN_SESSION_TIMEOUT_MS: 250
+      KAFKA_NUM_PARTITIONS: 1
+
+  mongodb:
+    hostname: mongodb
+    container_name: mongodb
+    image: mongodb/mongodb-atlas-local:8.2.7
+    ports:
+      - "27017:27017"
+    environment:
+      MONGODB_INITDB_ROOT_USERNAME: root
+      MONGODB_INITDB_ROOT_PASSWORD: secret
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  mongodb-init:
+    image: mongodb/mongodb-atlas-local:8.2.7
+    container_name: mongodb-init
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    restart: "no"
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        sleep 3
+        # add customer_reviews with its own vector index (run manually if needed):
+        mongosh "mongodb://root:secret@mongodb:27017/admin" --quiet --eval '
+          const db = db.getSiblingDB("reviews_db");
+          db.createCollection("customer_reviews");
+          db.runCommand({
+            createSearchIndexes: "customer_reviews",
+            indexes: [{
+              name: "vector_index",
+              type: "vectorSearch",
+              definition: {
+                fields: [{
+                  type: "vector",
+                  path: "embedding",
+                  numDimensions: 1536,
+                  similarity: "cosine"
+                }]
+              }
+            }]
+          })
+        '
