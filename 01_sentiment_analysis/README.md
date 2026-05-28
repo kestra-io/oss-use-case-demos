@@ -514,6 +514,265 @@ tasks:
         }
 ```
 
+## Bonus
+
+The flow you built so far in the previous steps works but it has two weaknesses: 
+
+1. configuration values are scattered as "magic strings" throughout task bodies
+2. there is no safety net if the LLM returns an unexpected response or a transient API error occurs.
+
+This bonus section addresses these shortcomings with incremental improvements.
+
+### Bonus Step 1: Flow-level variables
+
+#### What this step adds
+
+A `variables:` block at the top of the flow that centralises every value you might want to tune: model names, length thresholds, valid sentiment labels, confidence bounds, and the customer tier that triggers an alert. Tasks reference these via `{{ vars.<name> }}` instead of repeating literal strings in Pebble expressions. For instance, changing the LLM model or the alert tier now means editing one line at the top, not searching through task bodies.
+
+#### Add the variables block
+
+Open the flow in Kestra's flow editor and insert the following block somehwere at the beginning, e.g. between the `id`/`namespace` and the `triggers:` block:
+
+```yaml
+variables:
+  analyzer_model: gpt-4o-mini
+  embedding_model: text-embedding-3-small
+  min_review_length: 10
+  confidence_min: 0
+  confidence_max: 1
+  max_key_topics: 5
+  valid_sentiments:
+    - Positive
+    - Neutral
+    - Negative
+  customer_alert_tier: Premium
+```
+
+Then update the references that were previously hardcoded: 
+
+* In the `sentiment_analysis` task, change `modelName` and the prompt wording accordingly:
+
+```yaml
+  - id: sentiment_analysis
+    type: io.kestra.plugin.ai.completion.JSONStructuredExtraction
+    provider:
+      type: io.kestra.plugin.ai.provider.OpenAI
+      apiKey: "{{ secret('OPENAI_API_KEY') }}"
+      modelName: "{{ vars.analyzer_model }}"
+    ...
+    prompt: |
+      Analyse the following customer review and extract:
+
+      - sentiment: a JSON string mapping to exactly one of {{ vars.valid_sentiments | join(", ") }}
+      - confidence: a JSON number between {{ vars.confidence_min }} and {{ vars.confidence_max }} representing your certainty as a numeric value.
+      - key_topics: a JSON string array of up to {{ vars.max_key_topics }} key topics mentioned in the review
+      ...
+```
+
+* in the `ingest_to_vector_db` task, replace the hardcoded embedding model name:
+
+```yaml
+      modelName: "{{ vars.embedding_model }}"
+```
+
+* in `conditional_slack_alert`, replace the hardcoded tier string:
+
+```yaml
+    runIf: "{{ json(outputs.sentiment_analysis.extractedJson).sentiment == 'Negative' and trigger.value.customer_tier == vars.customer_alert_tier }}"
+```
+
+Click **Save**.
+
+#### What's happening
+
+* **`variables:` block**
+
+  A top-level YAML map whose entries are accessible anywhere in the flow as `{{ vars.<name> }}`. Unlike task outputs (which are produced at runtime), variables are static. They're resolved once when the execution starts and are available to every task and trigger expression in the flow.
+
+  The `valid_sentiments` entry is a YAML list. In the prompt it's rendered as a comma-separated string using Pebble's `join` filter: `{{ vars.valid_sentiments | join(", ") }}` produces `Positive, Neutral, Negative`. This keeps the prompt and any validation logic in sync with a single source of truth. Add or remove a sentiment value in one place and the change propagates everywhere.
+
+### Bonus Step 2: Input validation, Guardrails, and Retry
+
+#### What this step adds
+
+Three robustness features on the `sentiment_analysis` task:
+
+1. A **pre-flight check** that aborts the execution immediately if the incoming record received via the trigger either misses or has an empty review text. This prevents any unnecessary API calls.
+2. **Input and output guardrails** on the task itself that validate the review text length before calling the LLM and verify the LLM's response matches the expected structure before the execution proceeds. Especially the output guardrail is worth highlighting as it would prevent hallucinated structures or values which might violate the semantics in other ways.
+3. An **exponential backoff retry** that automatically re-attempts the LLM call on transient failures.
+
+#### Add the pre-flight check task
+
+Insert the following task to the existing task list**right before the `sentiment_analysis` task**:
+
+```yaml
+  - id: pre_validate_payload
+    type: io.kestra.plugin.core.execution.Fail
+    condition: "{{ trigger.value.review_text is null or trigger.value.review_text | length == 0 }}"
+    errorMessage: "review_text is missing or empty — aborting execution"
+```
+
+#### Add guardrails and retry to the `sentiment_analysis` task
+
+Append a `retry:` block and a `guardrails:` block to the `sentiment_analysis` task:
+
+```yaml
+    retry:
+      type: exponential
+      maxAttempts: 3
+      interval: PT1S
+      maxInterval: PT30S
+      delayFactor: 2.0
+    guardrails:
+      input:
+        - expression: "{{ trigger.value.review_text is not null and trigger.value.review_text | length >= vars.min_review_length }}"
+          message: "review_text is missing or too short to analyse"
+      output:
+        - expression: "{{ json(response).sentiment isIn vars.valid_sentiments }}"
+          message: "sentiment must be one of valid_sentiments"
+        - expression: "{{ json(response).confidence >= vars.confidence_min and json(response).confidence <= vars.confidence_max }}"
+          message: "confidence must be a number between confidence_min and confidence_max"
+        - expression: "{{ json(response).key_topics is not null and json(response).key_topics | length >= 1 and json(response).key_topics | length <= vars.max_key_topics }}"
+          message: "key_topics must be a non-empty list with at most max_key_topics items"
+```
+
+Click **Save**.
+
+#### What's happening
+
+* **`pre_validate_payload` task**
+
+  `io.kestra.plugin.core.execution.Fail` is a task whose only job is to fail the execution when its `condition` expression evaluates to `true`. Here it acts as an early exit gate: if `review_text` is null or empty the execution is terminated immediately with a clear `errorMessage`, no API call is made, and the problem is visible in the execution log. Without this, an empty review would silently reach the LLM and likely produce a nonsensical result while potentially wasting costs at the same time.
+
+* **Retry block**
+
+  The `retry:` block with `type: exponential` wraps the entire task in automatic re-attempt logic. If the LLM API returns an error or a network timeout occurs, Kestra waits `interval` (1 second), then doubles the wait on each subsequent failure (`delayFactor: 2.0`) up to `maxInterval` (30 seconds), for a maximum of `maxAttempts` (3) total attempts. Exponential backoff is a standard pattern for rate-limited or intermittently unavailable APIs. It avoids hammering the endpoint on repeated failures while still recovering automatically from brief outages.
+
+* **Input guardrail**
+
+  The `guardrails.input` block is evaluated before the LLM call. If the expression is false the task is marked as failed and the flow can respond accordingly (see Bonus Step 3). The input guardrail here re-checks the minimum length using `vars.min_review_length`, a slightly stricter gate than the null check above, since a one-word review is technically non-empty but too thin to analyse meaningfully for the use case at hand.
+
+* **Output guardrails**
+
+  The `guardrails.output` block is evaluated against the raw LLM response (available as `response`) before the task's output is committed. Three rules are enforced:
+  - `sentiment` must be one of the values in `vars.valid_sentiments` which guards against the LLM returning `"Mixed"` or `"Good"` as well as any punctuation or case mismatched in the returne string.
+  - `confidence` must be a number within the defined bounds which prevents e.g. an out-of-range float
+  - `key_topics` must be a non-empty list and must not exceed `vars.max_key_topics` items
+
+  When any output guardrail fails, Kestra sets `outputs.sentiment_analysis.guardrailViolated` to `true` and `outputs.sentiment_analysis.guardrailViolationMessage` to the first violated rule's message. The task itself does not proactively throw an error. The execution continues and it is up to downstream logic to decide what to do. That's exactly what bonus step 3 handles.
+
+---
+
+### Bonus Step 3: Guardrail-gated branching
+
+#### What this step adds
+
+A branching task that checks whether the LLM output passed all guardrails and routes execution accordingly. If validation passed, the pipeline continues normally as before. If validation failed, a `log_rejected` task records the reason. In a production flow the `else` branch could trigger any other Kestra task or flow to perform other actions: writing to a dead-letter queue, firing a different notification, or calling a remediation workflow.
+
+#### Restructure the tasks
+
+Replace the standalone `ingest_to_vector_db` and `conditional_slack_alert` tasks with a single `guardrail_check` task that wraps them in a `then` branch. Append an `else` branch for the failure case.
+
+The end of your `tasks:` list (after `sentiment_analysis`) should look like this:
+
+```yaml
+  - id: guardrail_check
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.sentiment_analysis.guardrailViolated == false }}"
+    then:
+      - id: ingest_to_vector_db
+        type: io.kestra.plugin.ai.rag.IngestDocument
+        provider:
+          type: io.kestra.plugin.ai.provider.OpenAI
+          apiKey: "{{ secret('OPENAI_API_KEY') }}"
+          modelName: "{{ vars.embedding_model }}"
+        embeddings:
+          type: io.kestra.plugin.ai.embeddings.MongoDBAtlas
+          host: mongodb
+          scheme: mongodb
+          username: root
+          password: "{{ secret('MONGODB_PASSWORD') }}"
+          database: reviews_db
+          collectionName: customer_reviews
+          indexName: vector_index
+          options:
+            authSource: admin
+          metadataFieldNames:
+            - review_id
+            - customer_id
+            - customer_tier
+            - product_id
+            - timestamp
+            - sentiment
+            - confidence
+            - key_topics
+        fromDocuments:
+          - content: "{{ trigger.value.review_text }}"
+            metadata:
+              review_id: "{{ trigger.value.review_id }}"
+              customer_id: "{{ trigger.value.customer_id }}"
+              customer_tier: "{{ trigger.value.customer_tier }}"
+              product_id: "{{ trigger.value.product_id }}"
+              timestamp: "{{ trigger.value.timestamp }}"
+              sentiment: "{{ json(outputs.sentiment_analysis.extractedJson).sentiment }}"
+              confidence: "{{ json(outputs.sentiment_analysis.extractedJson).confidence }}"
+              key_topics: "{{ json(outputs.sentiment_analysis.extractedJson).key_topics }}"
+
+      - id: conditional_slack_alert
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        runIf: "{{ json(outputs.sentiment_analysis.extractedJson).sentiment == 'Negative' and trigger.value.customer_tier == vars.customer_alert_tier }}"
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+            {
+              "blocks": [
+                {
+                  "type": "header",
+                  "text": { "type": "plain_text", "text": ":rotating_light: Negative Review — Premium Customer" }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    { "type": "mrkdwn", "text": "*Review ID:*\n{{ trigger.value.review_id }}" },
+                    { "type": "mrkdwn", "text": "*Customer:*\n{{ trigger.value.customer_id }}" },
+                    { "type": "mrkdwn", "text": "*Product:*\n{{ trigger.value.product_id }}" }
+                  ]
+                }
+              ]
+            }
+
+    else:
+      - id: log_rejected
+        type: io.kestra.plugin.core.log.Log
+        message: |
+          [REJECTED] Review failed guardrail validation
+          Review ID: {{ trigger.value.review_id }}
+          Reason: {{ outputs.sentiment_analysis.guardrailViolationMessage }}
+```
+
+Click **Save**.
+
+#### What's happening
+
+* **`io.kestra.plugin.core.flow.If` task**
+
+  Kestra's built-in branching task. It evaluates the `condition` expression and runs either the `then` task list or the `else` task list. The two branches are independent lists of tasks, each with their own `id` and `type`, and can be as long or as deep as needed.
+
+* **`condition`**
+
+  `{{ outputs.sentiment_analysis.guardrailViolated == false }}` reads the guardrail result written by the previous task. When all output guardrails passed this is `false` (no violation), so the `then` branch runs. When any guardrail fired it is `true`, so the `else` branch runs.
+
+* **`then` branch**
+
+  Contains `ingest_to_vector_db` and `conditional_slack_alert` unchanged from step 4 (with variable references updated from Bonus Step 1). These only run for reviews where the LLM output was fully valid, thereby protecting your vector store from malformed / hallucinated data.
+
+* **`else` branch**
+
+  Contains a single `log_rejected` task that writes the rejection reason to the execution log using `outputs.sentiment_analysis.guardrailViolationMessage`. This is the simplest possible response to a guardrail failure. In a real system you could replace or extend this branch with any Kestra task. The branching pattern is the same regardless of what the `else` branch contains and does.
+
+### Complete flow reference
+
+The full v5 flow combining all bonus steps is in [`flows/reviews_sentiment_v5.yaml`](flows/reviews_sentiment_v5.yaml).
+
 ---
 
 ## Teardown
